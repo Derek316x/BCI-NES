@@ -5,8 +5,14 @@ Team Name: Bae-ta Waves
 Team Members: 
 
 Derek Netto, Columbia University 
+
+
 Uma Mohan, Columbia University 
+
+
 Ankeet Parikh, Rutgers University 
+
+
 Salman Qasim, Columbia University 
 
 Project: BCI-NES 
