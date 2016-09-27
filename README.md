@@ -29,3 +29,4 @@ The main difficulty we encountered was wrt to online streaming/processing/analys
 
 We plan to extend this framework in the near future and hope to add videos to this Github (eventually) showing a fully functional BCI-NES experience! 
 
+We'd like to give a big thanks to Dr. Iyad Obeid and Temple University for hosting us, and Dr. Paul Sajda for sponsoring our team.
