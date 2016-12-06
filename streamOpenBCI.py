@@ -6,13 +6,17 @@ Script for the online streaming, pre-processing, and analysis of EEG from OpenBC
 import libmushu
 from wyrm import processing as proc 
 from wyrm import io 
-from wyrm.types import RingBuffer 
+from wyrm.types import BlockBuffer 
 import time
 import numpy
 import scipy
+from scipy import signal 
 from Quartz.CoreGraphics import CGEventCreateKeyboardEvent
 from Quartz.CoreGraphics import CGEventPost
 import os
+import time
+import matplotlib
+from matplotlib import pyplot as plt
 
 # Python releases things automatically, using CFRelease will result in a scary error
 #from Quartz.CoreGraphics import CFRelease
@@ -25,12 +29,12 @@ from Quartz.CoreGraphics import kCGHIDEventTap
 
 ''' 
 1) First, open cmd window and then cd into /Users/salman.qasim/anaconda/pkgs/OpenBCI_Python-master
-2) python user.py -p=/dev/tty.usbserial-DJ00IWYI --add streamer_lsl
+2) python user.py -p=/dev/tty.usbserial-DQ0084AI --add streamer_lsl
 3) /start
 4) execute code below 
+5) remember to change port in ampdecorator.py
 
 '''
-
 def KeyTap(k):
     KeyDown(k)
     KeyUp(k)
@@ -270,6 +274,9 @@ amp = libmushu.get_amp(ampname)
 amp.configure()
 amp_fs, aux_fs = amp.get_sampling_frequency() # standard for openBci should be ~ 256 Hz 
 
+# -----------------TODO ---------------
+# alter this depending on our cap, or better yet generalize it. 
+
 amp_channels = ['Ch0', 'Ch1', 'Ch2', 'Ch3', 'Ch4', 'Ch5', 'Ch6', 'Ch7'] #amp.get_channels() # should be 17 of them 
 aux_channels = ['Ch13', 'Ch14', 'Ch15']
 Fp1 = 0
@@ -286,57 +293,121 @@ n_aux = len(aux_channels)
 
 fn = amp_fs / 2 # Nyquist 
 # Get filter coefficients 
-b_band, a_band = proc.signal.butter(5,[2/fn, 40/fn],btype='band')
+b_band, a_band = signal.butter(4, [4/fn, 50/fn], 'bandpass')
+#b_band, a_band = proc.signal.butter(5,[5/fn, 40/fn],btype='band')
 #b_high, a_high = proc.signal.butter(5,[1/fn],btype = 'high')
 zi_band = proc.lfilter_zi(b_band,a_band,n_channels)
 zi_aux = proc.lfilter_zi(b_band, a_band, n_aux) # only for the EMG filtering
 #zi_high = proc.lfilter_zi(b_high,a_high,n_channels)
 
 #---- Start the amplifier data stream 
-streamed_data = numpy.empty([1,8]) # initialize datastream array 
-streamed_aux = numpy.empty([1,3]) 
+streamed_raw = numpy.empty([1,8]) # initialize datastream array 
+streamed_spect = numpy.empty([1,8])
+#streamed_aux = numpy.empty([1,3]) 
 time_of_data = numpy.empty([1,1])
 amp.start()
 start = time.time()   
 sample_num = 0 
-# setup ring buffer 
-rb = RingBuffer(1000) # set this up so we always have the last 1000 ms of data 
+# setup block buffer 
+# -----------------TODO ---------------
+# Set this up to work properly: have to use this to filter the data in real time 
+#bb = BlockBuffer(100) # set this up so we always have the last 1000 ms of data 
+
 tick = 0
 baseline = 0
-while True:
-    sample_num += 1 
-    delta = time.time() - start  
-    data, auxdata = amp.get_data() #, triger
-    trigger = (time.time()-start,'fuck') # gets raletive time stamp
-    cnt = io.convert_mushu_data(data,trigger, amp_fs, amp_channels) # convert to wyrm format 
-    aux_cnt =io.convert_mushu_data(auxdata,trigger,aux_fs,aux_channels)
-    #cnt.data = proc.rectify_channels(cnt.data)
-    cnt, zi_band = proc.lfilter(cnt, b_band, a_band, zi = zi_band) # lowpass the data  
-    aux_cnt, zi_aux = proc.lfilter(aux_cnt, b_band, a_band, zi = zi_aux)
-    #cnt, zi_low = proc.lfilter(cnt, b_high, a_high, zi = zi_high) # highpass 
-#        # don't worry about subsampling necessarily 
-    newsamples = cnt.data.shape[1] 
-    streamed_data = numpy.concatenate((streamed_data, cnt.data), axis=0)
-    streamed_aux = numpy.concatenate((streamed_aux, aux_cnt.data), axis =0)
-    if delta > 30 and delta <32.5: # 60 seconds have passed
-        # establish a baseline amplitude for each channel 
-        amplitude_baseline = numpy.median(streamed_data, axis=0) # uses the median to decrease the effect of outliers 
-        amplitude_threshold = 4*amplitude_baseline     
-        aux_threshold = numpy.median(streamed_aux, axis = 0)
-        # calculate the alpha power as well 
-        alpha_baseline =[]
-        for i in range(n_channels):
-            freqs, Pxx = scipy.signal.welch(streamed_data[:,i],fs = amp_fs)
-            lowerbound = indices(freqs, lambda x: x>7)
-            lowerbound = lowerbound[0]
-            upperbound = indices(freqs, lambda x: x>12)
-            upperbound = upperbound[0]
-            alpha_baseline.append(numpy.mean(Pxx[lowerbound:upperbound])) # make sure the dimensions on this are ok 
-        alpha_baseline = numpy.array([alpha_baseline])
-        alpha_baseline =  alpha_baseline * 3
 
-        emg_threshold_left = 2.5 * amplitude_baseline[emg_chan] 
-        emg_threshold_right = 5 * amplitude_baseline[emg_chan]
+## Setup the plot the of the spectrogram? 
+# fig, ax = plt.subplots()
+# ax.axis([0, 100, 0, 1])
+#
+# y = numpy.random.rand(100)
+# lines = ax.plot(y)
+#
+# fig.canvas.manager.show() 
+left_accuracy =[1]
+right_accuracy = [1]
+    
+left_emg_chan = 3 # 4 -1
+right_emg_chan = 4 # 5-1 
+    
+left_beta_window = []
+
+right_beta_window = []
+
+# Collect data for ITR 
+left_decision = [1] 
+right_decision = [1]    
+left_action = [1] 
+right_action = [1]
+
+i=0
+while True:
+    sample_num += 1  # number of data acquisitions 
+    delta = time.time() - start  
+    data, auxdata = amp.get_data() # get the data 
+    trigger = (time.time()-start,'trigger') # gets relative time stamp, can serve as a psuedo marker
+    cnt = io.convert_mushu_data(data,trigger, amp_fs, amp_channels) # convert to wyrm format
+    #cnt, zi_band = proc.lfilter(cnt, b_band, a_band, zi = zi_band) # bandpass the data  
+    #aux_cnt, zi_aux = proc.lfilter(aux_cnt, b_band, a_band, zi = zi_aux)
+    #cnt, zi_low = proc.lfilter(cnt, b_high, a_high, zi = zi_high) # highpass 
+
+        # don't worry about subsampling necessarily 
+    #cnt = proc.subsample(cnt,100) # subsamples the data from 240 Hz to 50 Hz
+    streamed_raw = numpy.concatenate((streamed_raw, cnt.data), axis=0) # buffer the streaming data 
+
+    #cnt_log_spectrum = proc.logarithm(cnt_spectrum) # this is the logged spectrum 
+#    bb.append(cnt)
+ #   cnt = bb.get()
+        #aux_cnt =io.convert_mushu_data(auxdata,trigger,aux_fs,aux_channels)
+    #cnt.data = proc.rectify_channels(cnt.data)
+
+    #cnt_spectrum = proc.spectrum(cnt)
+    #frequencies = cnt_spectrum.axes
+
+
+    #streamed_spect = numpy.concatenate((streamed_spect,cnt_spectrum.data),axis=0)
+    #streamed_aux = numpy.concatenate((streamed_aux, aux_cnt.data), axis =0)
+    
+# First ,let's estabish some person specific baselines in a 30 second period     
+
+
+    # One of the problems we have here is big deflections of the signal in the first ~10 sec
+
+    
+    
+    if delta > 30 and delta <32.5: # 30 seconds have passed
+        # establish a baseline amplitude for each channel 
+        streamed_raw = streamed_raw[2500:,:]
+        #aux_threshold = 10*numpy.median(streamed_aux, axis = 0)
+        # calculate the beta power as well 
+        left_beta_baseline =[]
+        right_beta_baseline =[]
+        
+        # bandpass the data 
+        streamed_filt = signal.filtfilt(b_band, a_band, streamed_raw, axis = 0)
+        amplitude_baseline = numpy.median(streamed_filt, axis=0) # uses the median to decrease the effect of outliers 
+        amplitude_threshold = 5*amplitude_baseline   # may be good for checking ITR  
+
+        
+        freqs, left_Pxx = scipy.signal.welch(streamed_filt[:,1],fs = amp_fs) # i = 1 = channel 2 on the openBCI 
+        freqs, right_Pxx = scipy.signal.welch(streamed_filt[:,6],fs = amp_fs) # i = 6 = channel 7 on the openBCI             
+        lowerbound = indices(freqs, lambda x: x>13)
+        lowerbound = lowerbound[0]
+        upperbound = indices(freqs, lambda x: x>30)
+        upperbound = upperbound[0]
+        
+        left_beta_baseline.append(numpy.mean(left_Pxx[lowerbound:upperbound])) # make sure the dimensions on this are ok 
+        right_beta_baseline.append(numpy.mean(left_Pxx[lowerbound:upperbound])) # make sure the dimensions on this are ok 
+
+        left_beta_baseline = numpy.array([left_beta_baseline])
+        left_beta_baseline =  left_beta_baseline
+        right_beta_baseline = numpy.array([right_beta_baseline])
+        right_beta_baseline =  right_beta_baseline 
+        
+        # compare this to the atreamed_spect data 
+        emg_threshold_left = 4 * amplitude_baseline[left_emg_chan] 
+        emg_threshold_right = 4 * amplitude_baseline[right_emg_chan]
+        
         # get the baseline for theta power and beta power in emg 
 #        freq_emg, Pemg = scipy.signal.welch(streamed_data[:,emg_chan],aux_fs)
 #        lowerbound1 = indices(freqs, lambda x: x>3)
@@ -360,91 +431,117 @@ while True:
     else:
         continue
     end_baseline = time.time() 
-    winAdvance = 20.0
+    winAdvance = 40.0
     winLen = 400.0
     if baseline==1: # indicating that baseline has occured
         time.sleep(winLen/1000)
     post_baseline = time.time()- end_baseline
     T = winLen/1000
-    if post_baseline > T: # run the first window 
+    while post_baseline > T: # run the first window 
         # initiate analysis 
-        analysis_end = streamed_data.shape[0]
-        analysis_begin = int(streamed_data.shape[0] - (amp_fs*winLen/1000))
-        data_windowed = streamed_data[analysis_begin:analysis_end,:]
-        aux_windowed = streamed_aux[analysis_begin:analysis_end,:]
+        os.system('say "move now"')
+        analysis_end = streamed_raw.shape[0]
+        analysis_begin = int(streamed_raw.shape[0] - (amp_fs*winLen/100)) # grab the last 1000 samples for analysis 
+        data_windowed = streamed_filt[analysis_begin:analysis_end,:]
+#        aux_windowed = streamed_aux[analysis_begin:analysis_end,:]
         amplitude_window= numpy.median(data_windowed, axis=0) # uses the median to decrease the effect of outliers 
-        aux_amplitude_window = numpy.median(aux_windowed, axis = 0)
-        
-        # analysis: mean amplitude over the window, alpha power over the window =
-#        freq_emg, Pemg = scipy.signal.welch(data_windowed[:,emg_chan],aux_fs)
-#        lowerbound1 = indices(freqs, lambda x: x>3)
-#        lowerbound1 = lowerbound1[0]
-#        upperbound1 = indices(freqs, lambda x: x>8)
-#        upperbound1 = upperbound1[0]
-#        lowerbound2 = indices(freqs, lambda x: x>13)
-#        lowerbound2 = lowerbound2[0]
-#        upperbound2 = indices(freqs, lambda x: x>29)
-#        upperbound2 = upperbound2[0]
+#        aux_amplitude_window = numpy.median(aux_windowed, axis = 0)
 #        
-#        theta_emg_window = numpy.mean(Pxx[lowerbound1:upperbound1])
-#        beta_emg_window = numpy.mean(Pxx[lowerbound2:upperbound2])
-        
-        # Check which behavioral condition is true
-        
-        #EYEBLINK CONDN 
-        if numpy.abs(amplitude_window[Fp1]) > numpy.abs(amplitude_threshold[Fp1]) or numpy.abs(amplitude_window[Fp2]) > numpy.abs(amplitude_threshold[Fp2]):
-            time.sleep(.001)
-            KeyDown('j')
+#        # analysis: mean amplitude over the window, alpha power over the window =
+##        freq_emg, Pemg = scipy.signal.welch(data_windowed[:,emg_chan],aux_fs)
+##        lowerbound1 = indices(freqs, lambda x: x>3)
+##        lowerbound1 = lowerbound1[0]
+##        upperbound1 = indices(freqs, lambda x: x>8)
+##        upperbound1 = upperbound1[0]
+##        lowerbound2 = indices(freqs, lambda x: x>13)
+##        lowerbound2 = lowerbound2[0]
+##        upperbound2 = indices(freqs, lambda x: x>29)
+##        upperbound2 = upperbound2[0]
+##        
+##        theta_emg_window = numpy.mean(Pxx[lowerbound1:upperbound1])
+##        beta_emg_window = numpy.mean(Pxx[lowerbound2:upperbound2])
+#        
+#        # Check which behavioral condition is true
+#        
+#        #EYEBLINK CONDN 
+#        if numpy.abs(amplitude_window[Fp1]) > numpy.abs(amplitude_threshold[Fp1]) or numpy.abs(amplitude_window[Fp2]) > numpy.abs(amplitude_threshold[Fp2]):
+#            KeyDown('j')
+#            time.sleep(.016)
+#            KeyUp('j')
+#            
+#            # control: if held down for too long, just keyup
+#        else:
+#            KeyUp('j')
+#            time.sleep(.5)
+
+
+        # EMG CONDN to help compute ITR (true decision)
+
+        if numpy.abs(amplitude_window[left_emg_chan])> numpy.abs(emg_threshold_left):
+            left_decision.append(1)
+
+        if numpy.abs(amplitude_window[right_emg_chan])> numpy.abs(emg_threshold_right):
+            right_decision.append(1)            
             
-            # control: if held down for too long, just keyup
-        else:
-            time.sleep(.001)
-            KeyUp('j')
-
-        # EMG CONDN
         
-        if numpy.abs(amplitude_window[emg_chan])> numpy.abs(emg_threshold_left):
-            time.sleep(.001)
-            KeyDown('a')
-        else:
-            time.sleep(.001)
-            KeyUp('a') 
-
-        if numpy.abs(amplitude_window[emg_chan])> numpy.abs(emg_threshold_right):
-            time.sleep(.001)
-            KeyDown('d')
-        else:
-            time.sleep(.001)
-            KeyUp('d')
-        
-        if tick!= 1 and (numpy.abs(aux_amplitude_window[accel_chan]) >  numpy.abs(aux_threshold[accel_chan])): # make sure to set this threshold fairly high
-            time.sleep(.001)
-            KeyDown('w')
-            tick = 1
-        elif tick== 1 and numpy.abs((aux_amplitude_window[accel_chan]) >  numpy.abs(aux_threshold[accel_chan])):
-            time.sleep(.001)
-            KeyUp('w')
-            tick = 0
+#        if tick!= 1 and (numpy.abs(aux_amplitude_window[accel_chan]) >  numpy.abs(aux_threshold[accel_chan])): # make sure to set this threshold fairly high
+#            KeyDown('w')
+#            time.sleep(.04)
+#            tick = 1
+#        elif tick== 1 and numpy.abs((aux_amplitude_window[accel_chan]) >  numpy.abs(aux_threshold[accel_chan])):
+#            KeyUp('w')
+#            time.sleep(.04)
+#            tick = 0
        
-        alpha_window = []
         
-        for i in range(n_channels):
-            freqs, Pxx = scipy.signal.welch(data_windowed[:,i],fs = amp_fs)
-            lowerbound3 = indices(freqs, lambda x: x>7)
-            lowerbound3 = lowerbound3[0]
-            upperbound3 = indices(freqs, lambda x: x>12)
-            upperbound3 = upperbound3[0]
-            alpha_window.append(numpy.mean(Pxx[lowerbound3:upperbound3]))
+        freqs, left_Pxx = scipy.signal.welch(data_windowed[:,1],fs = amp_fs)
+        freqs, right_Pxx = scipy.signal.welch(data_windowed[:,6],fs = amp_fs)            
+        lowerbound3 = indices(freqs, lambda x: x>13)
+        lowerbound3 = lowerbound3[0]
+        upperbound3 = indices(freqs, lambda x: x>30)
+        upperbound3 = upperbound3[0]
+        left_beta_window.append(numpy.mean(left_Pxx[lowerbound3:upperbound3]))
+        right_beta_window.append(numpy.mean(right_Pxx[lowerbound3:upperbound3]))
 
-        compare = (numpy.array([alpha_window]) >  alpha_baseline)
-        if compare.any(): # i can specify a channel here if that helps 
-            # SEND KEY COMMAND TO QUIT
-            time.sleep(.1)
-            KeyDown('g')
+
+        if numpy.abs(numpy.mean(left_Pxx[lowerbound3:upperbound3])) <  left_beta_baseline: # i can specify a channel here if that helps 
+            left_action.append(1)            
+            KeyDown('a')
+            time.sleep(.016)
+            KeyUp('a')
         else:
-            time.sleep(winAdvance/1000) # put this mofo to sleep for 50 ms
+            KeyUp('a') 
+            time.sleep(.04)
+            
+        if numpy.abs(numpy.mean(right_Pxx[lowerbound3:upperbound3])) <  right_beta_baseline: # i can specify a channel here if that helps 
+            right_action.append(1)            
+            KeyDown('d')
+            time.sleep(.016)
 
-    if delta>60*20:
+        else:
+            KeyUp('d')
+            time.sleep(.04)
+        
+        left_accuracy.append(sum(left_decision)/sum(left_action))
+        right_accuracy.append(sum(right_decision)/sum(right_action))
+        
+    else:
+        sample_num += 1 
+        delta = time.time() - start  
+        data, auxdata = amp.get_data() #, triger
+        trigger = (time.time()-start,'fuck') # gets raletive time stamp
+        cnt = io.convert_mushu_data(data,trigger, amp_fs, amp_channels) # convert to wyrm format
+        cnt, zi_band = proc.lfilter(cnt, b_band, a_band, zi = zi_band) # bandpass the data  
+            #aux_cnt, zi_aux = proc.lfilter(aux_cnt, b_band, a_band, zi = zi_aux)
+            #cnt, zi_low = proc.lfilter(cnt, b_high, a_high, zi = zi_high) # highpass 
+
+        # don't worry about subsampling necessarily 
+        cnt = proc.subsample(cnt,100) # subsamples the data from 240 Hz to 50 Hz
+        streamed_raw = numpy.concatenate((streamed_raw, cnt.data), axis=0)
+            #streamed_aux = numpy.concatenate((streamed_aux, aux_cnt.data), axis =0)
+        time.sleep(winAdvance/1000) # put this mofo to sleep for 50 ms
+
+    if delta>60*6:
         break
 
 end = time.time()
